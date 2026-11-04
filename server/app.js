@@ -62,7 +62,11 @@ function setSession(res, token) {
 }
 
 app.get('/api/health', wrap(async (req, res) => {
-  res.json({ ok: true, store: process.env.DATABASE_URL ? 'postgres' : 'file' });
+  res.json({
+    ok: true,
+    store: process.env.DATABASE_URL ? 'postgres' : 'file',
+    vercel: Boolean(process.env.VERCEL),
+  });
 }));
 
 app.post('/api/auth/register', wrap(async (req, res) => {
