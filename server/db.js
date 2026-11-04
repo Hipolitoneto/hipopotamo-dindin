@@ -56,6 +56,7 @@ function seed() {
       priceCents,
       emoji,
       color,
+      description: '',
       active: true,
       createdAt: now,
     })),
@@ -73,9 +74,71 @@ function read() {
   return JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
 }
 
+let sqlClient;
+let schemaReady;
+
+function postgres() {
+  if (!sqlClient) {
+    sqlClient = import('@neondatabase/serverless').then(({ neon }) => neon(process.env.DATABASE_URL));
+  }
+  return sqlClient;
+}
+
+async function ensureSchema(sql) {
+  if (!schemaReady) {
+    schemaReady = sql`CREATE TABLE IF NOT EXISTS ledger (
+      id integer PRIMARY KEY,
+      version integer NOT NULL,
+      data jsonb NOT NULL
+    )`.catch((error) => {
+      schemaReady = null;
+      throw error;
+    });
+  }
+  return schemaReady;
+}
+
+function parseLedger(row) {
+  const data = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
+  return { version: Number(row.version), db: data };
+}
+
+async function loadPostgres() {
+  const sql = await postgres();
+  await ensureSchema(sql);
+  let rows = await sql`SELECT version, data FROM ledger WHERE id = 1`;
+  if (!rows.length) {
+    const seeded = seed();
+    await sql`INSERT INTO ledger (id, version, data)
+      VALUES (1, 1, ${JSON.stringify(seeded)}::jsonb)
+      ON CONFLICT (id) DO NOTHING`;
+    rows = await sql`SELECT version, data FROM ledger WHERE id = 1`;
+  }
+  return parseLedger(rows[0]);
+}
+
+async function savePostgres(db, version) {
+  const sql = await postgres();
+  const rows = await sql`UPDATE ledger
+    SET data = ${JSON.stringify(db)}::jsonb, version = version + 1
+    WHERE id = 1 AND version = ${version}
+    RETURNING version`;
+  return rows.length > 0;
+}
+
+async function load() {
+  if (process.env.DATABASE_URL) return loadPostgres();
+  if (process.env.VERCEL) fail('O caderno online ainda não está ligado a um banco.', 503);
+  return { version: 0, db: read() };
+}
+
 let chain = Promise.resolve();
 
 function mutate(fn) {
+  if (process.env.VERCEL && !process.env.DATABASE_URL) {
+    fail('O caderno online ainda não está ligado a um banco.', 503);
+  }
+  if (process.env.DATABASE_URL) return mutatePostgres(fn);
   const run = chain.then(() => {
     const db = read();
     const result = fn(db);
@@ -84,6 +147,15 @@ function mutate(fn) {
   });
   chain = run.then(() => {}, () => {});
   return run;
+}
+
+async function mutatePostgres(fn) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const { db, version } = await loadPostgres();
+    const result = fn(db);
+    if (await savePostgres(db, version)) return result;
+  }
+  fail('O caderno estava ocupado. Tenta de novo.', 503);
 }
 
 export function publicUser(user) {
@@ -173,9 +245,9 @@ function hydrate(db, pickup) {
   };
 }
 
-export function getUserByToken(token) {
+export async function getUserByToken(token) {
   if (!token) return null;
-  const db = read();
+  const { db } = await load();
   const session = db.sessions.find((item) => item.token === token && item.expiresAt > Date.now());
   if (!session) return null;
   const user = db.users.find((item) => item.id === session.userId);
@@ -206,7 +278,7 @@ export async function registerUser({ name, username, password }) {
 
 export async function authenticate(username, password) {
   const normalized = String(username || '').trim().toLowerCase();
-  const db = read();
+  const { db } = await load();
   const user = db.users.find((item) => item.username === normalized);
   if (!user || !(await bcrypt.compare(String(password || ''), user.passwordHash))) {
     fail('Usuário ou senha não confere.', 401);
@@ -237,7 +309,7 @@ export function deleteSession(token) {
 
 export async function changePassword(userId, current, next) {
   const password = cleanPassword(next, 'A nova senha');
-  const db = read();
+  const { db } = await load();
   const user = db.users.find((item) => item.id === userId);
   if (!user) fail('Faça login de novo.', 401);
   if (!(await bcrypt.compare(String(current || ''), user.passwordHash))) {
@@ -252,8 +324,8 @@ export async function changePassword(userId, current, next) {
   });
 }
 
-export function listFlavors(user) {
-  const db = read();
+export async function listFlavors(user) {
+  const { db } = await load();
   const flavors = user.role === 'admin' ? [...db.flavors] : db.flavors.filter((flavor) => flavor.active);
   flavors.sort((a, b) => Number(b.active) - Number(a.active) || a.name.localeCompare(b.name, 'pt-BR'));
   return flavors.map((flavor) => ({ ...flavor, description: flavor.description || '' }));
@@ -314,8 +386,8 @@ function sortedPickups(db, rows) {
     .sort((a, b) => b.pickupDate.localeCompare(a.pickupDate) || b.createdAt.localeCompare(a.createdAt));
 }
 
-export function listPickups(user) {
-  const db = read();
+export async function listPickups(user) {
+  const { db } = await load();
   const rows = user.role === 'admin' ? db.pickups : db.pickups.filter((item) => item.userId === user.id);
   return sortedPickups(db, rows);
 }
